@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>mhf9025_joint_state</name>
+  <version>0.1.0</version>
+  <description>MHF9025-V3 CAN joint feedback and experimental oscillation for LM-Calibr.</description>
+  <maintainer email="cuong@example.com">cuong</maintainer>
+  <license>GPL-3.0-only</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

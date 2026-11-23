@@ -1,0 +1,38 @@
+lidar_topic: "/livox/lidar"
+encoder_topic: "/joint_states"
+
+# true_encoder_time = encoder_time + time_offset
+time_offset: 0.0
+
+# for mid360
+DH_type: 0
+# Joint calibration from bags s2-s5; pending independent validation.
+extrinsic:
+# VERSION 1
+  # d_1: 0.097500000000000003        
+  # a_1: -0.0017684734541305591
+  # phi_1: 1.5543384104018323
+  # theta_2: 1.5662740424839454
+  # d_2: 0.027880927495407288
+  # a_2: 0.0
+  # phi_2: 0.0
+
+# VERSION 2
+  d_1: 0.097500000000000003
+  a_1: -0.0016957977515407005
+  phi_1: 1.5702025914395612
+  theta_2: 1.5726578190105782
+  d_2: 0.031351255053113279
+  a_2: 0.0
+  phi_2: 0.0
+
+# # for Non-Omni LiDAR
+# DH_type: 1
+# extrinsic:
+#   d_1: 0.05
+#   a_1: 0.0
+#   phi_1: 1.57079633
+#   theta_2: -0.002645289235848494
+#   d_2: 0.0001847859009746622
+#   a_2: 0.03370932638818411
+#   phi_2: -0.00943702929342231

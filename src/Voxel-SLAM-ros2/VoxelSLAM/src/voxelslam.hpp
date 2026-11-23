@@ -1,0 +1,367 @@
+#pragma once
+
+#include "tools.hpp"
+#include "ekf_imu.hpp"
+#include "voxel_map.hpp"
+#include "feature_point.hpp"
+#include "loop_refine.hpp"
+#include <mutex>
+#include <Eigen/Eigenvalues>
+#include <rclcpp/rclcpp.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <std_msgs/msg/empty.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <malloc.h>
+#include <geometry_msgs/msg/pose_array.hpp>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <malloc.h>
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/navigation/ImuFactor.h>
+#include <gtsam/navigation/CombinedImuFactor.h>
+#include <gtsam/nonlinear/GaussNewtonOptimizer.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <Eigen/Sparse>
+#include <Eigen/SparseQR>
+#include "BTC.h"
+
+using namespace std;
+
+// Global node pointer
+extern rclcpp::Node::SharedPtr g_node;
+extern std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
+
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_scan;
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cmap;
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_init;
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_pmap;
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_test;
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_prev_path;
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_curr_path;
+rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr pub_relocalized;
+
+rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu;
+rclcpp::SubscriptionBase::SharedPtr sub_pcl;
+
+template <typename T>
+void pub_pl_func(T &pl, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pub)
+{
+  pl.height = 1; pl.width = pl.size();
+  sensor_msgs::msg::PointCloud2 output;
+  pcl::toROSMsg(pl, output);
+  output.header.frame_id = "camera_init";
+  output.header.stamp = g_node->now();
+  pub->publish(output);
+}
+
+mutex mBuf;
+Features feat;
+deque<sensor_msgs::msg::Imu::SharedPtr> imu_buf;
+deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
+deque<double> time_buf;
+
+double imu_last_time = -1;
+int point_notime = 0;
+double last_pcl_time = -1;
+
+void imu_handler(const sensor_msgs::msg::Imu::SharedPtr msg_in)
+{
+  static int flag = 1;
+  if(flag)
+  {
+    flag = 0;
+    double stamp_sec = static_cast<double>(msg_in->header.stamp.sec) +
+                       static_cast<double>(msg_in->header.stamp.nanosec) * 1e-9;
+    RCLCPP_INFO(rclcpp::get_logger("voxelslam"), "First IMU timestamp: %.6f", stamp_sec);
+  }
+
+  sensor_msgs::msg::Imu::SharedPtr msg = std::make_shared<sensor_msgs::msg::Imu>(*msg_in);
+
+  mBuf.lock();
+  imu_last_time = static_cast<double>(msg->header.stamp.sec) +
+                  static_cast<double>(msg->header.stamp.nanosec) * 1e-9;
+  imu_buf.push_back(msg);
+  mBuf.unlock();
+}
+
+template<class T>
+void pcl_handler(T &msg)
+{
+  pcl::PointCloud<PointType>::Ptr pl_ptr(new pcl::PointCloud<PointType>());
+  double t0 = feat.process(msg, *pl_ptr);
+
+  // Reject stale pointcloud data (timestamp significantly behind current IMU time)
+  // This prevents crashes when old buffered data has outdated timestamps
+  if(imu_last_time > 0 && t0 < imu_last_time - 1.0)
+  {
+    RCLCPP_WARN_THROTTLE(g_node->get_logger(), *g_node->get_clock(), 1000,
+                         "Rejecting stale pointcloud (pcl_time=%.3f, imu_time=%.3f, diff=%.3f)",
+                         t0, imu_last_time, imu_last_time - t0);
+    return;
+  }
+
+  if(pl_ptr->empty())
+  {
+    PointType ap;
+    ap.x = 0; ap.y = 0; ap.z = 0;
+    ap.intensity = 0; ap.curvature = 0;
+    pl_ptr->push_back(ap);
+    ap.curvature = 0.09;
+    pl_ptr->push_back(ap);
+  }
+
+  sort(pl_ptr->begin(), pl_ptr->end(), [](PointType &x, PointType &y)
+  {
+    return x.curvature < y.curvature;
+  });
+  while(pl_ptr->back().curvature > 0.11)
+    pl_ptr->points.pop_back();
+
+  mBuf.lock();
+  time_buf.push_back(t0);
+  pcl_buf.push_back(pl_ptr);
+  mBuf.unlock();
+}
+
+inline double get_stamp_sec(const builtin_interfaces::msg::Time &stamp)
+{
+  return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1e-9;
+}
+
+bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::msg::Imu::SharedPtr> &imus, IMUEKF &p_imu)
+{
+  static bool pl_ready = false;
+
+  if(!pl_ready)
+  {
+    if(pcl_buf.empty())
+    {
+      RCLCPP_DEBUG_THROTTLE(g_node->get_logger(), *g_node->get_clock(), 5000,
+                            "Waiting for pointcloud data...");
+      return false;
+    }
+
+    mBuf.lock();
+    pl_ptr = pcl_buf.front();
+    p_imu.pcl_beg_time = time_buf.front();
+    pcl_buf.pop_front(); time_buf.pop_front();
+    mBuf.unlock();
+
+    p_imu.pcl_end_time = p_imu.pcl_beg_time + pl_ptr->back().curvature;
+
+    // Skip stale data that would cause timestamp regression
+    // This can happen if old data was buffered before processing started
+    if(p_imu.last_pcl_end_time > 0 && p_imu.last_pcl_end_time - p_imu.pcl_beg_time > 0.01)
+    {
+      RCLCPP_WARN(g_node->get_logger(),
+                  "Skipping stale buffered data (pcl_beg=%.3f, last_pcl_end=%.3f, diff=%.3f)",
+                  p_imu.pcl_beg_time, p_imu.last_pcl_end_time,
+                  p_imu.last_pcl_end_time - p_imu.pcl_beg_time);
+      pl_ready = false;
+      return false;
+    }
+
+    if(point_notime)
+    {
+      if(last_pcl_time < 0)
+      {
+        last_pcl_time = p_imu.pcl_beg_time;
+        return false;
+      }
+
+      p_imu.pcl_end_time = p_imu.pcl_beg_time;
+      p_imu.pcl_beg_time = last_pcl_time;
+      last_pcl_time = p_imu.pcl_end_time;
+    }
+
+    pl_ready = true;
+  }
+
+  if(!pl_ready || imu_last_time <= p_imu.pcl_end_time)
+  {
+    if(pl_ready)
+      RCLCPP_DEBUG_THROTTLE(g_node->get_logger(), *g_node->get_clock(), 5000,
+                            "Waiting for IMU data... (imu_last=%.3f, pcl_end=%.3f)",
+                            imu_last_time, p_imu.pcl_end_time);
+    return false;
+  }
+
+  mBuf.lock();
+  double imu_time = get_stamp_sec(imu_buf.front()->header.stamp);
+  while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time))
+  {
+    imu_time = get_stamp_sec(imu_buf.front()->header.stamp);
+    if(imu_time > p_imu.pcl_end_time) break;
+    imus.push_back(imu_buf.front());
+    imu_buf.pop_front();
+  }
+  mBuf.unlock();
+
+  if(imu_buf.empty())
+  {
+    RCLCPP_FATAL(g_node->get_logger(), "IMU buffer exhausted unexpectedly! Check IMU topic and timestamp sync.");
+    rclcpp::shutdown();
+    exit(1);
+  }
+
+  pl_ready = false;
+
+  if(imus.size() > 4)
+  {
+    if(pl_ptr->size() < 100) {
+      RCLCPP_WARN(g_node->get_logger(),
+        "[DEBUG] sync_packages: LOW POINT COUNT! pcl_size=%zu may cause issues", pl_ptr->size());
+    }
+    return true;
+  }
+  else
+  {
+    RCLCPP_WARN_THROTTLE(g_node->get_logger(), *g_node->get_clock(), 5000,
+                         "Insufficient IMU samples (%zu < 5) between scans. Check IMU rate.", imus.size());
+    return false;
+  }
+}
+
+double dept_err, beam_err;
+void calcBodyVar(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &var)
+{
+  if (pb[2] == 0)
+    pb[2] = 0.0001;
+  float range = sqrt(pb[0] * pb[0] + pb[1] * pb[1] + pb[2] * pb[2]);
+  float range_var = range_inc * range_inc;
+  Eigen::Matrix2d direction_var;
+  direction_var << pow(sin(DEG2RAD(degree_inc)), 2), 0, 0, pow(sin(DEG2RAD(degree_inc)), 2);
+  Eigen::Vector3d direction(pb);
+  direction.normalize();
+  Eigen::Matrix3d direction_hat;
+  direction_hat << 0, -direction(2), direction(1), direction(2), 0, -direction(0), -direction(1), direction(0), 0;
+  Eigen::Vector3d base_vector1(1, 1, -(direction(0) + direction(1)) / direction(2));
+  base_vector1.normalize();
+  Eigen::Vector3d base_vector2 = base_vector1.cross(direction);
+  base_vector2.normalize();
+  Eigen::Matrix<double, 3, 2> N;
+  N << base_vector1(0), base_vector2(0), base_vector1(1), base_vector2(1), base_vector1(2), base_vector2(2);
+  Eigen::Matrix<double, 3, 2> A = range * direction_hat * N;
+  var = direction * range_var * direction.transpose() + A * direction_var * A.transpose();
+};
+
+// Compute the variance of the each point
+void var_init(IMUST &ext, pcl::PointCloud<PointType> &pl_cur, PVecPtr pptr, double dept_err, double beam_err)
+{
+  int plsize = pl_cur.size();
+  pptr->clear();
+  pptr->resize(plsize);
+  for(int i=0; i<plsize; i++)
+  {
+    PointType &ap = pl_cur[i];
+    pointVar &pv = pptr->at(i);
+    pv.pnt << ap.x, ap.y, ap.z;
+    calcBodyVar(pv.pnt, dept_err, beam_err, pv.var);
+    pv.pnt = ext.R * pv.pnt + ext.p;
+    pv.var = ext.R * pv.var * ext.R.transpose();
+  }
+}
+
+void pvec_update(PVecPtr pptr, IMUST &x_curr, PLV(3) &pwld)
+{
+  Eigen::Matrix3d rot_var = x_curr.cov.block<3, 3>(0, 0);
+  Eigen::Matrix3d tsl_var = x_curr.cov.block<3, 3>(3, 3);
+
+  for(pointVar &pv: *pptr)
+  {
+    Eigen::Matrix3d phat = hat(pv.pnt);
+    pv.var = x_curr.R * pv.var * x_curr.R.transpose() + phat * rot_var * phat.transpose() + tsl_var;
+    pwld.push_back(x_curr.R * pv.pnt + x_curr.p);
+  }
+}
+
+// Read the alidarstate.txt
+void read_lidarstate(string filename, vector<ScanPose*> &bl_tem)
+{
+  ifstream file(filename);
+  if(!file.is_open())
+  {
+    RCLCPP_FATAL(g_node->get_logger(), "Failed to open lidar state file: %s", filename.c_str());
+    RCLCPP_FATAL(g_node->get_logger(), "Please ensure the previous map files exist at the specified save_path.");
+    rclcpp::shutdown();
+    exit(1);
+  }
+
+  string lineStr, str;
+  vector<double> nums;
+  while(getline(file, lineStr))
+  {
+    nums.clear();
+    stringstream ss(lineStr);
+    while(getline(ss, str, ' '))
+      nums.push_back(stod(str));
+
+    IMUST xx;
+    xx.t = nums[0];
+    xx.p << nums[1], nums[2], nums[3];
+    xx.R = Eigen::Quaterniond(nums[7], nums[4], nums[5], nums[6]).matrix();
+
+    if(nums.size() >= 20)
+    {
+      xx.v << nums[8], nums[9], nums[10];
+      xx.bg << nums[11], nums[12], nums[13];
+      xx.ba << nums[14], nums[15], nums[16];
+      xx.g << nums[17], nums[18], nums[19];
+    }
+
+    ScanPose* blp = new ScanPose(xx, nullptr);
+    bl_tem.push_back(blp);
+
+    if(nums.size() >= 26)
+      for(int i=0; i<6; i++)
+        blp->v6[i] = nums[i + 20];
+  }
+}
+
+double get_memory()
+{
+  ifstream infile("/proc/self/status");
+  double mem = -1;
+  string lineStr, str;
+  while(getline(infile, lineStr))
+  {
+    stringstream ss(lineStr);
+    bool is_find = false;
+    while(ss >> str)
+    {
+      if(str == "VmRSS:")
+      {
+        is_find = true; continue;
+      }
+
+      if(is_find) mem = stod(str);
+      break;
+    }
+    if(is_find) break;
+  }
+  return mem / (1048576);
+}
+
+void icp_check(pcl::PointCloud<PointType> &pl_src, pcl::PointCloud<PointType> &pl_tar,
+               rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pub_src,
+               rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pub_tar,
+               pair<Eigen::Vector3d, Eigen::Matrix3d> &loop_transform, IMUST &xx)
+{
+  pcl::PointCloud<PointType> pl1, pl2;
+  for(PointType ap: pl_src.points)
+  {
+    Eigen::Vector3d v(ap.x, ap.y, ap.z);
+    v = loop_transform.second * v + loop_transform.first;
+    v = xx.R * v + xx.p;
+    ap.x = v[0]; ap.y = v[1]; ap.z = v[2];
+    pl1.push_back(ap);
+  }
+  for(PointType ap: pl_tar.points)
+  {
+    Eigen::Vector3d v(ap.x, ap.y, ap.z);
+    v = xx.R * v + xx.p;
+    ap.x = v[0]; ap.y = v[1]; ap.z = v[2];
+    pl2.push_back(ap);
+  }
+  pub_pl_func(pl1, pub_src); pub_pl_func(pl2, pub_tar);
+}
